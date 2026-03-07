@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+
 #include "common.h"
 
 #include "params.h"
@@ -9,6 +11,7 @@
 #include "sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
 #include "smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
 #include "smxx/decode/combine/combine.h"
+#include "smxx/decode/sparse_bf16/splitkv_mla.h"
 
 // Feature set of sparse decoding kernels
 enum class DecodeFeatures : int {
@@ -180,6 +183,37 @@ protected:
     }
 };
 
+class Decode_Bf16_Impl : public DecodeImplBase {
+    DECLARE_SUPPORTED_FEATURES(
+        DecodeFeatures::HEAD_64,
+        DecodeFeatures::HEAD_128,
+        DecodeFeatures::HEAD_DIM_512,
+        DecodeFeatures::HEAD_DIM_576,
+        DecodeFeatures::V32_KVCACHE_FORMAT,
+        DecodeFeatures::MODEL1_KVCACHE_FORMAT,
+        DecodeFeatures::ATTN_SINK,
+        DecodeFeatures::TOPK_LENGTH,
+        DecodeFeatures::EXTRA_KVCACHE,
+        DecodeFeatures::EXTRA_TOPK_LENGTH
+    )
+
+public:
+    DecodeImplMeta get_meta(int h_q, int s_q) override {
+        Arch arch = Arch();
+        return {
+            std::max(arch.num_sms / s_q / std::max(h_q / 64, 1), 1),
+            5,
+            64
+        };
+    }
+
+protected:
+    void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
+        (void)required_features;
+        smxx::decode::sparse_bf16::run_flash_splitkv_mla_bf16_sparse_kernel(params);
+    }
+};
+
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
 sparse_attn_decode_interface(
     const at::Tensor &q,   // [b, s_q, h_q, d_qk]
@@ -212,6 +246,7 @@ sparse_attn_decode_interface(
     int page_block_size = kv.size(1);
     int h_kv = kv.size(2);
     int topk = indices.size(2);
+    bool is_fp8_kvcache = kv.dtype() == torch::kFloat8_e4m3fn || kv.dtype() == torch::kInt8 || kv.dtype() == torch::kUInt8;
 
     bool have_topk_length = topk_length.has_value();
     bool have_extra_kcache = extra_kv.has_value();
@@ -257,9 +292,13 @@ sparse_attn_decode_interface(
 
     // Check data type
     KU_CHECK_DTYPE(q, torch::kBFloat16);
-    TORCH_CHECK(kv.dtype() == torch::kFloat8_e4m3fn || kv.dtype() == torch::kInt8 || kv.dtype() == torch::kUInt8, "key must have dtype fp8_e4m3fn, int8 or uint8");
+    TORCH_CHECK(is_fp8_kvcache || kv.dtype() == torch::kBFloat16, "key must have dtype bfloat16, fp8_e4m3fn, int8 or uint8");
     if (extra_kv.has_value()) {
-        TORCH_CHECK(extra_kv->dtype() == torch::kFloat8_e4m3fn || extra_kv->dtype() == torch::kInt8 || extra_kv->dtype() == torch::kUInt8, "extra k cache must have dtype fp8_e4m3fn, int8 or uint8");
+        if (is_fp8_kvcache) {
+            TORCH_CHECK(extra_kv->dtype() == torch::kFloat8_e4m3fn || extra_kv->dtype() == torch::kInt8 || extra_kv->dtype() == torch::kUInt8, "extra k cache must have dtype fp8_e4m3fn, int8 or uint8 when kv cache is fp8");
+        } else {
+            TORCH_CHECK(extra_kv->dtype() == torch::kBFloat16, "extra k cache must have dtype bfloat16 when kv cache is bfloat16");
+        }
     }
     KU_CHECK_DTYPE(indices, torch::kInt32);
     KU_CHECK_DTYPE(topk_length, torch::kInt32);
@@ -285,7 +324,7 @@ sparse_attn_decode_interface(
     
     // Check shape
     KU_CHECK_SHAPE(q, b, s_q, h_q, d_qk);
-    {
+    if (is_fp8_kvcache) {
         int bytes_per_token;
         if (d_qk == 576 && d_v == 512) {
             // V3.2 style
@@ -302,6 +341,9 @@ sparse_attn_decode_interface(
         if (extra_kv.has_value()) {
             TORCH_CHECK(extra_kv->stride(1) == bytes_per_token, "The whole block must be contiguous when is_fp8_cache is True for extra kv cache");
         }
+    } else {
+        KU_CHECK_SHAPE(kv, num_blocks, page_block_size, h_kv, d_qk);
+        KU_CHECK_SHAPE(extra_kv, extra_num_blocks, extra_page_block_size, h_kv, d_qk);
     }
     KU_CHECK_SHAPE(indices, b, s_q, topk);
     KU_CHECK_SHAPE(topk_length, b);
@@ -360,24 +402,28 @@ sparse_attn_decode_interface(
     }
 
     DecodeImplBase* impl;
-    if (arch.is_sm100f()) {
-        if (h_q == 64) {
-            impl = new Decode_Sm100_Head64_Impl();
-        } else if (h_q == 128) {
-            if (d_qk == 576) {
-                impl = new Decode_Sm100_Head64x2_Impl();
-            } else if (d_qk == 512) {
-                impl = new Decode_Sm100_Head128_Impl();
+    if (is_fp8_kvcache) {
+        if (arch.is_sm100f()) {
+            if (h_q == 64) {
+                impl = new Decode_Sm100_Head64_Impl();
+            } else if (h_q == 128) {
+                if (d_qk == 576) {
+                    impl = new Decode_Sm100_Head64x2_Impl();
+                } else if (d_qk == 512) {
+                    impl = new Decode_Sm100_Head128_Impl();
+                } else {
+                    TORCH_CHECK(false, "Unsupported d_qk: ", d_qk);
+                }
             } else {
-                TORCH_CHECK(false, "Unsupported d_qk: ", d_qk);
+                TORCH_CHECK(false, "Unsupported h_q: ", h_q);
             }
+        } else if (arch.is_sm90a()) {
+            impl = new Decode_Sm90_Impl();
         } else {
-            TORCH_CHECK(false, "Unsupported h_q: ", h_q);
+            TORCH_CHECK(false, "Unsupported architecture for sparse decode fwd");
         }
-    } else if (arch.is_sm90a()) {
-        impl = new Decode_Sm90_Impl();
     } else {
-        TORCH_CHECK(false, "Unsupported architecture for sparse decode fwd");
+        impl = new Decode_Bf16_Impl();
     }
 
     DecodeImplMeta impl_meta = impl->get_meta(h_q, s_q);

@@ -81,7 +81,7 @@ def flash_mla_with_kvcache(
         num_splits_placeholder: must be "None" (to be compatible with the old interface).
         softmax_scale: float. The scaling of QK^T before applying softmax. Default to 1 / sqrt(head_dim_k).
         causal: bool. Whether to apply causal attention mask. Only valid for dense attention
-        is_fp8_kvcache: bool.
+        is_fp8_kvcache: bool. When sparse attention is enabled, both fp8 KV cache and bf16 KV cache are supported.
         indices: (batch_size, seq_len_q, topk). KV indices when sparse attention is enabled.
                     Pay attention that indices_in_kvcache[i][j][k] = (the index of the page block where token t resides) * block_size + (the offset of token t among the page block),
                     where t is the k-th token of the j-th q-sequence in the i-th batch.
@@ -89,7 +89,11 @@ def flash_mla_with_kvcache(
         extra_k_cache and extra_indices_in_kvcache: If provided, will attend to these extra tokens in addition to those in k_cache and indices_in_kvcache. Their format requirements are the same as k_cache and indices_in_kvcache respectively.
         topk_length/extra_topk_length: (batch_size, ), torch.int32. If provided, only the leftmost topk_length indices will be processed. Useful when the actual topk for different queries are different so that we can save some computation, compared to masking.
     
-    For DeepSeek V3, DeepSeek V3.1, and DeepSeek V3.2:
+    For sparse bf16 KV cache:
+        `k_cache` and `extra_k_cache` should have shape `(num_blocks, page_block_size, num_heads_k, head_dim)` with dtype `torch.bfloat16`.
+        The key uses all `head_dim` values, while the value uses the first `head_dim_v` values.
+
+    For DeepSeek V3, DeepSeek V3.1, and DeepSeek V3.2 fp8 sparse KV cache:
         head_dim should be 576 while head_dim_v should be 512.
         In FP8+sparse mode, each token's KV cache is 656 Bytes, structured as:
             - The shape of the tensor `k_cache` is (num_blocks, page_block_size, num_heads_k, head_dim), and num_heads_k must be 1.
@@ -151,7 +155,6 @@ def flash_mla_with_kvcache(
     if topk is not None:
         # Sparse attention
         assert not causal, "causal must be False when sparse attention is enabled"
-        assert is_fp8_kvcache, "is_fp8_kvcache must be True when sparse attention is enabled"
         out, lse, new_tile_scheduler_metadata, new_num_splits = flash_mla_cuda.sparse_decode_fwd(
             q, k_cache, indices_in_kvcache, topk_length, attn_sink,
             sched_meta.tile_scheduler_metadata, sched_meta.num_splits,

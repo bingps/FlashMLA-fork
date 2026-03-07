@@ -224,7 +224,7 @@ class TestcaseForDecode:
     kv_scope: KVScope
     extra_kv_scope: Optional[KVScope]
 
-def generate_testcase_for_decode(t: TestParam) -> TestcaseForDecode:
+def generate_testcase_for_decode(t: TestParam, is_fp8_kvcache: bool = True) -> TestcaseForDecode:
     kk.set_random_seed(t.seed)
     assert t.h_q % t.h_kv == 0
     assert t.decode is not None
@@ -289,14 +289,16 @@ def generate_testcase_for_decode(t: TestParam) -> TestcaseForDecode:
         return KVScope(t, cache_seqlens, block_table, blocked_k, abs_indices, indices_in_kvcache, topk_length)
 
     kv_scope0 = generate_one_k_scope(t.s_kv, t.decode.block_size, t.topk, t.decode.is_varlen, t.decode.have_zero_seqlen_k, t.is_all_indices_invalid, t.have_topk_length)
-    kv_scope0.quant_and_dequant_()
+    if is_fp8_kvcache:
+        kv_scope0.quant_and_dequant_()
     if t.decode.extra_topk is not None:
         if t.decode.extra_s_k is None:
             t.decode.extra_s_k = t.decode.extra_topk*2
         if t.decode.extra_block_size is None:
             t.decode.extra_block_size = t.decode.block_size
         kv_scope1 = generate_one_k_scope(t.decode.extra_s_k, t.decode.extra_block_size, t.decode.extra_topk, t.decode.is_varlen, t.decode.have_zero_seqlen_k, t.is_all_indices_invalid, t.decode.have_extra_topk_length)
-        kv_scope1.quant_and_dequant_()
+        if is_fp8_kvcache:
+            kv_scope1.quant_and_dequant_()
     else:
         assert t.decode.extra_block_size is None and t.decode.extra_s_k is None and not t.decode.have_extra_topk_length
         kv_scope1 = None
@@ -316,18 +318,18 @@ def run_flash_mla_sparse_fwd(p: TestParam, t: Testcase, return_p_sum: bool):
         topk_length=t.topk_length
     )
 
-def run_flash_mla_decode(p: TestParam, t: TestcaseForDecode, tile_scheduler_metadata, num_splits):
+def run_flash_mla_decode(p: TestParam, t: TestcaseForDecode, tile_scheduler_metadata, num_splits, is_fp8_kvcache: bool = True):
     assert p.decode is not None
     return flash_mla.flash_mla_with_kvcache(
         t.q,
-        t.kv_scope.get_kvcache_for_flash_mla(),
+        t.kv_scope.get_kvcache_for_flash_mla() if is_fp8_kvcache else t.kv_scope.blocked_k,
         None, None, p.d_v,
         tile_scheduler_metadata, num_splits,
 
-        t.sm_scale, False, True,
+        t.sm_scale, False, is_fp8_kvcache,
         t.kv_scope.indices_in_kvcache,
         t.attn_sink,
-        t.extra_kv_scope.get_kvcache_for_flash_mla() if t.extra_kv_scope is not None else None,
+        (t.extra_kv_scope.get_kvcache_for_flash_mla() if is_fp8_kvcache else t.extra_kv_scope.blocked_k) if t.extra_kv_scope is not None else None,
         t.extra_kv_scope.indices_in_kvcache if t.extra_kv_scope is not None else None,
         t.kv_scope.topk_length,
         t.extra_kv_scope.topk_length if t.extra_kv_scope is not None and t.extra_kv_scope.topk_length is not None else None
@@ -364,7 +366,7 @@ class FlopsAndMemVolStatisticsForDecode:
     flop: float
     mem_vol: float
 
-def count_flop_and_mem_vol_for_decode(p: TestParam, t: TestcaseForDecode) -> FlopsAndMemVolStatisticsForDecode:
+def count_flop_and_mem_vol_for_decode(p: TestParam, t: TestcaseForDecode, is_fp8_kvcache: bool = True) -> FlopsAndMemVolStatisticsForDecode:
     assert p.decode
     b = p.decode.b
 
@@ -390,7 +392,7 @@ def count_flop_and_mem_vol_for_decode(p: TestParam, t: TestcaseForDecode) -> Flo
     num_retrieved_tokens = get_num_retrieved_tokens(t.kv_scope) + (get_num_retrieved_tokens(t.extra_kv_scope) if t.extra_kv_scope is not None else 0)
 
     compute_flop = 2 * p.h_q * num_attended_tokens * (p.d_qk + p.d_v)
-    kv_token_size = 656 if p.d_qk == 576 else 576   # Assume FP8 KV Cache
+    kv_token_size = (656 if p.d_qk == 576 else 576) if is_fp8_kvcache else p.d_qk * 2
     mem_vol = sum([
         2 * b * p.s_q * p.h_q * p.d_qk, # Q
         num_retrieved_tokens * kv_token_size,   # K
