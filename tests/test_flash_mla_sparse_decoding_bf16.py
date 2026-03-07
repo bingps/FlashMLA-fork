@@ -21,9 +21,9 @@ def gen_testcase() -> List[RawTestParam]:
     corner_cases = []
 
     for d_qk in [576, 512]:
-        for have_extra_k in ([False, True] if d_qk == 512 else [False, True]):
+        for have_extra_k in ([False, True] if d_qk == 512 else [False]):
             for have_extra_topk_len in ([False, True] if have_extra_k else [False]):
-                for have_topk_len in [False, True]:
+                for have_topk_len in ([False, True] if d_qk == 512 else [False]):
                     for h_q in [64, 128]:
                         cur_correctness_cases = [
                             RawTestParam(
@@ -40,19 +40,30 @@ def gen_testcase() -> List[RawTestParam]:
                                 num_runs=0,
                             )
                             for (s_k, topk, block_size) in [
-                                (256, 64, 16),
+                                (512, 64, 2),
                                 (512, 64, 64),
-                                (1024, 320 if d_qk == 512 else 576, 61),
+                                (512, 64, 69),
+                                (1024, 576, 2),
+                                (1024, 576, 61),
+                                (2046, 2048, 2),
+                                (2046, 2048, 64),
+                                (2046, 2048, 576),
                             ]
                             for (extra_s_k, extra_topk, extra_block_size) in (
                                 [
-                                    (256, 33, 8),
-                                    (768, 128, 64),
+                                    (512, 64, 2),
+                                    (512, 64, 64),
+                                    (512, 64, 69),
+                                    (1024, 576, 2),
+                                    (1024, 576, 61),
+                                    (2046, 2048, 2),
+                                    (2046, 2048, 64),
+                                    (2046, 2048, 576),
                                 ] if have_extra_k else [(None, None, None)]
                             )
-                            for b in [2, 17]
+                            for b in [4, 74, 321]
                             for s_q in [1, 3]
-                            for is_varlen in ([True, False] if (b == 17 and not have_topk_len and not have_extra_topk_len) else [True])
+                            for is_varlen in ([True, False] if (b == 74 and not have_topk_len and not have_extra_topk_len) else [True])
                         ]
                         correctness_cases.extend(cur_correctness_cases)
 
@@ -73,18 +84,18 @@ def gen_testcase() -> List[RawTestParam]:
                                 num_runs=0,
                             )
                             for (s_k, topk, block_size) in [
-                                (257, 64, 17),
-                                (650, 320 if d_qk == 512 else 576, 53),
+                                (512, 64, 61),
+                                (650, 576, 53),
                             ]
                             for (extra_s_k, extra_topk, extra_block_size) in (
                                 [
-                                    (257, 31, 7),
-                                    (650, 79, 29),
+                                    (512, 64, 61),
+                                    (650, 576, 53),
                                 ] if have_extra_k else [(None, None, None)]
                             )
-                            for b in [2, 17]
+                            for b in [4, 74, 321]
                             for s_q in [3]
-                            for is_varlen in ([True, False] if (b == 17 and not have_topk_len and not have_extra_topk_len) else [True])
+                            for is_varlen in ([True, False] if (b == 74 and not have_topk_len and not have_extra_topk_len) else [True])
                             for is_all_indices_invalid in [True, False]
                             for have_zero_seqlen_k in [True, False]
                             for enable_attn_sink in [True, False]
@@ -106,7 +117,7 @@ def gen_testcase() -> List[RawTestParam]:
         for b in bszs
     ]
 
-    return performance_cases
+    # return performance_cases
     return correctness_cases + corner_cases + performance_cases
 
 
@@ -143,8 +154,22 @@ def _make_bf16_decode_inputs_packed(t):
     return t
 
 
+def _expect_optimized_kernel(t) -> bool:
+    major, minor = torch.cuda.get_device_capability()
+    is_sm90a = (major, minor) == (9, 0)
+    if not is_sm90a:
+        return False
+
+    packed_q = t.q.stride(-1) == 1 and t.q.stride(-2) == t.q.shape[-1] and t.q.stride(-3) == t.q.shape[-2] * t.q.shape[-1]
+    packed_kv = t.kv_scope.blocked_k.stride(-1) == 1 and t.kv_scope.blocked_k.stride(-2) == t.kv_scope.blocked_k.shape[-1]
+    packed_extra_kv = True
+    if t.extra_kv_scope is not None:
+        packed_extra_kv = t.extra_kv_scope.blocked_k.stride(-1) == 1 and t.extra_kv_scope.blocked_k.stride(-2) == t.extra_kv_scope.blocked_k.shape[-1]
+    return packed_q and packed_kv and packed_extra_kv
+
+
 @torch.inference_mode()
-def run_one_case(p: TestParam, packed_layout: bool = False) -> Result:
+def run_one_case(p: TestParam, packed_layout: bool = True) -> Result:
     if p.seed == -1:
         global _counter
         p.seed = _counter.next()
@@ -168,7 +193,7 @@ def run_one_case(p: TestParam, packed_layout: bool = False) -> Result:
         out_ans, lse_ans = run_decode()
         torch.cuda.synchronize()
 
-    performance_result = Result(True, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, False)
+    performance_result = Result(True, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, _expect_optimized_kernel(t))
     if p.num_runs > 0:
         result = kk.bench_kineto(run_decode, p.num_runs)
 
@@ -254,7 +279,7 @@ def test_flash_mla_sparse_decoding_bf16():
     torch.set_num_threads(32)
 
     testcase = RawTestParam(
-        b=2,
+        b=4,
         h_q=64,
         s_q=2,
         h_kv=1,
@@ -263,10 +288,10 @@ def test_flash_mla_sparse_decoding_bf16():
         topk=64,
         have_topk_length=True,
         enable_attn_sink=True,
-        extra_s_k=256,
-        extra_topk=33,
-        block_size=32,
-        extra_block_size=16,
+        extra_s_k=512,
+        extra_topk=64,
+        block_size=64,
+        extra_block_size=64,
         have_extra_topk_length=True,
         d_qk=512,
         check_correctness=True,
@@ -329,14 +354,14 @@ def main():
         if testcase != testcases[0] and testcase.num_runs > 0 and not is_no_cooldown:
             time.sleep(0.3)
         print(f"[{testcase_idx+1:{num_testcases_len}d}/{len(testcases)}, {testcase_idx/len(testcases)*100:3.0f}%]  ", end="")
-        packed_layout = testcase.num_runs > 0
-        result = run_one_case(testcase, packed_layout=packed_layout)
+        # packed_layout = testcase.num_runs > 0
+        result = run_one_case(testcase, packed_layout=True)
         results.append((testcase, result))
         if not result.is_correct:
             failed_cases.append(testcase)
             import sys
             sys.exit(1)
-        if packed_layout and not result.used_optimized_kernel:
+        if not result.used_optimized_kernel:
             failed_cases.append(testcase)
             raise RuntimeError(f"Expected optimized kernel for benchmark case, but fallback path was used: {testcase}")
 

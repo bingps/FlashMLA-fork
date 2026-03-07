@@ -12,7 +12,6 @@
 #include "sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
 #include "smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
 #include "smxx/decode/combine/combine.h"
-#include "smxx/decode/sparse_bf16/splitkv_mla.h"
 
 // Feature set of sparse decoding kernels
 enum class DecodeFeatures : int {
@@ -224,15 +223,13 @@ protected:
             return packed_q && packed_kv && packed_o && packed_extra_kv;
         };
 
-        if (arch.is_sm90a() && is_packed_bf16_layout()) {
-            DISPATCH_MODEL_TYPE(params.model_type, MODEL_TYPE, [&]() {
-                DISPATCH_NUM_HEADS(params.h_q, NUM_HEADS, [&]() {
-                    sm90::decode::sparse_bf16::run_flash_splitkv_mla_bf16_sparse_kernel<MODEL_TYPE, NUM_HEADS>(params);
-                });
+        TORCH_CHECK(arch.is_sm90a(), "BF16 sparse decode is only supported on SM90a");
+        TORCH_CHECK(is_packed_bf16_layout(), "BF16 sparse decode requires packed Q/KV/output layouts on SM90a");
+        DISPATCH_MODEL_TYPE(params.model_type, MODEL_TYPE, [&]() {
+            DISPATCH_NUM_HEADS(params.h_q, NUM_HEADS, [&]() {
+                sm90::decode::sparse_bf16::run_flash_splitkv_mla_bf16_sparse_kernel<MODEL_TYPE, NUM_HEADS>(params);
             });
-        } else {
-            smxx::decode::sparse_bf16::run_flash_splitkv_mla_bf16_sparse_kernel(params);
-        }
+        });
     }
 };
 

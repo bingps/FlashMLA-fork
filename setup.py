@@ -69,7 +69,6 @@ ext_modules.append(
             # Misc kernels for decoding
             "csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
             "csrc/smxx/decode/combine/combine.cu",
-            "csrc/smxx/decode/sparse_bf16/splitkv_mla.cu",
 
             # sm90 dense decode
             "csrc/sm90/decode/dense/instantiations/fp16.cu",
