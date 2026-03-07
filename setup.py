@@ -76,6 +76,10 @@ ext_modules.append(
             "csrc/sm90/decode/dense/instantiations/bf16.cu",
 
             # sm90 sparse decode
+            "csrc/sm90/decode/sparse_bf16/instantiations/model1_persistent_h64.cu",
+            "csrc/sm90/decode/sparse_bf16/instantiations/model1_persistent_h128.cu",
+            "csrc/sm90/decode/sparse_bf16/instantiations/v32_persistent_h64.cu",
+            "csrc/sm90/decode/sparse_bf16/instantiations/v32_persistent_h128.cu",
             "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu",
             "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu",
             "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu",

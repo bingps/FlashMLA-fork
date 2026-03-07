@@ -6,6 +6,7 @@
 
 #include "params.h"
 
+#include "sm90/decode/sparse_bf16/splitkv_mla.h"
 #include "sm90/decode/sparse_fp8/splitkv_mla.h"
 #include "sm100/decode/head64/kernel.h"
 #include "sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
@@ -210,7 +211,28 @@ public:
 protected:
     void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
         (void)required_features;
-        smxx::decode::sparse_bf16::run_flash_splitkv_mla_bf16_sparse_kernel(params);
+        Arch arch = Arch();
+        auto is_packed_bf16_layout = [&]() {
+            bool packed_q = params.stride_q_h_q == params.d_qk && params.stride_q_s_q == params.h_q * params.d_qk;
+            bool packed_kv = params.stride_kv_row == params.d_qk && params.stride_kv_block == params.page_block_size * params.h_kv * params.d_qk;
+            bool packed_o = params.stride_o_h_q == params.d_v && params.stride_o_s_q == params.h_q * params.d_v;
+            bool packed_extra_kv = true;
+            if (params.extra_kv != nullptr) {
+                packed_extra_kv = params.stride_extra_kv_row == params.d_qk &&
+                    params.stride_extra_kv_block == params.extra_page_block_size * params.h_kv * params.d_qk;
+            }
+            return packed_q && packed_kv && packed_o && packed_extra_kv;
+        };
+
+        if (arch.is_sm90a() && is_packed_bf16_layout()) {
+            DISPATCH_MODEL_TYPE(params.model_type, MODEL_TYPE, [&]() {
+                DISPATCH_NUM_HEADS(params.h_q, NUM_HEADS, [&]() {
+                    sm90::decode::sparse_bf16::run_flash_splitkv_mla_bf16_sparse_kernel<MODEL_TYPE, NUM_HEADS>(params);
+                });
+            });
+        } else {
+            smxx::decode::sparse_bf16::run_flash_splitkv_mla_bf16_sparse_kernel(params);
+        }
     }
 };
 

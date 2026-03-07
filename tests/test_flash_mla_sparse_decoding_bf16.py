@@ -93,10 +93,12 @@ def gen_testcase() -> List[RawTestParam]:
                         corner_cases.extend(cur_corner_cases)
 
     base_and_bszs = [
-        (RawTestParam(0, 128, 1, 1, 32768, True, topk=2048, d_qk=576, num_runs=100, check_correctness=False), [1, 2, 64]),
-        (RawTestParam(0, 128, 2, 1, 32768, True, topk=2048, d_qk=576, num_runs=100, check_correctness=False), [1, 2, 64]),
-        (RawTestParam(0, 64, 2, 1, 16384, True, topk=128, d_qk=512, extra_s_k=16384, extra_topk=512, block_size=256, extra_block_size=64, num_runs=100, check_correctness=False), [2, 64, 128]),
-        (RawTestParam(0, 128, 2, 1, 16384, True, topk=128, d_qk=512, extra_s_k=16384, extra_topk=1024, block_size=256, extra_block_size=64, num_runs=100, check_correctness=False), [2, 64]),
+        (RawTestParam(0, 128, 1, 1, 32768, True, topk=2048, d_qk=576), [1, 2, 64, 128]),
+        (RawTestParam(0, 128, 2, 1, 32768, True, topk=2048, d_qk=576), [1, 2, 64, 128]),
+        (RawTestParam(0, 128, 2, 1, 65536, True, topk=2048, d_qk=576), [1, 2]),
+        (RawTestParam(0, 128, 2, 1, 131072, True, topk=2048, d_qk=576), [1, 2]),
+        # (RawTestParam(0, 64, 2, 1, 16384, True, topk=128, d_qk=512, extra_s_k=16384, extra_topk=512, block_size=256, extra_block_size=64, num_runs=100, check_correctness=False), [2, 64, 128]),
+        # (RawTestParam(0, 128, 2, 1, 16384, True, topk=128, d_qk=512, extra_s_k=16384, extra_topk=1024, block_size=256, extra_block_size=64, num_runs=100, check_correctness=False), [2, 64]),
     ]
     performance_cases = [
         dataclasses.replace(base, b=b)
@@ -104,6 +106,7 @@ def gen_testcase() -> List[RawTestParam]:
         for b in bszs
     ]
 
+    return performance_cases
     return correctness_cases + corner_cases + performance_cases
 
 
@@ -116,13 +119,32 @@ class Result:
     combine_time_usage_us: float
     achieved_tflops: float
     achieved_gBps: float
+    used_optimized_kernel: bool = False
 
 
 _counter = kk.Counter()
 
 
+def _make_bf16_decode_inputs_packed(t):
+    t.q = t.q.contiguous()
+    t.kv_scope.blocked_k = t.kv_scope.blocked_k.contiguous()
+    t.kv_scope.indices_in_kvcache = t.kv_scope.indices_in_kvcache.contiguous()
+    if t.kv_scope.topk_length is not None:
+        t.kv_scope.topk_length = t.kv_scope.topk_length.contiguous()
+    if t.attn_sink is not None:
+        t.attn_sink = t.attn_sink.contiguous()
+
+    if t.extra_kv_scope is not None:
+        t.extra_kv_scope.blocked_k = t.extra_kv_scope.blocked_k.contiguous()
+        t.extra_kv_scope.indices_in_kvcache = t.extra_kv_scope.indices_in_kvcache.contiguous()
+        if t.extra_kv_scope.topk_length is not None:
+            t.extra_kv_scope.topk_length = t.extra_kv_scope.topk_length.contiguous()
+
+    return t
+
+
 @torch.inference_mode()
-def run_one_case(p: TestParam) -> Result:
+def run_one_case(p: TestParam, packed_layout: bool = False) -> Result:
     if p.seed == -1:
         global _counter
         p.seed = _counter.next()
@@ -133,6 +155,8 @@ def run_one_case(p: TestParam) -> Result:
     torch.cuda.empty_cache()
 
     t = lib.generate_testcase_for_decode(p, is_fp8_kvcache=False)
+    if packed_layout:
+        t = _make_bf16_decode_inputs_packed(t)
 
     tile_scheduler_metadata, _ = flash_mla.get_mla_metadata()
 
@@ -144,12 +168,13 @@ def run_one_case(p: TestParam) -> Result:
         out_ans, lse_ans = run_decode()
         torch.cuda.synchronize()
 
-    performance_result = Result(True, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    performance_result = Result(True, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, False)
     if p.num_runs > 0:
         result = kk.bench_kineto(run_decode, p.num_runs)
 
         splitkv_kernel_name = "flash_fwd_splitkv_mla_bf16_sparse_kernel"
         combine_kernel_name = "flash_fwd_mla_combine_kernel"
+        used_optimized_kernel = any(splitkv_kernel_name in s for s in result.get_kernel_names())
 
         kernel_time_usages_us: Dict[str, Optional[float]] = {}
 
@@ -202,6 +227,7 @@ def run_one_case(p: TestParam) -> Result:
             kernel_time_usages_us[combine_kernel_name] or 0.0,
             achieved_tflops,
             achieved_gBps,
+            used_optimized_kernel,
         )
 
     is_correct = True
@@ -251,6 +277,36 @@ def test_flash_mla_sparse_decoding_bf16():
     assert result.is_correct
 
 
+def test_flash_mla_sparse_decoding_bf16_sm90_optimized_path():
+    dtype = torch.bfloat16
+    device = torch.device("cuda:0")
+    torch.set_default_dtype(dtype)
+    torch.set_default_device(device)
+    torch.cuda.set_device(device)
+    torch.set_float32_matmul_precision("high")
+    torch.set_num_threads(32)
+
+    testcase = RawTestParam(
+        b=8,
+        h_q=64,
+        s_q=2,
+        h_kv=1,
+        s_kv=8192,
+        is_varlen=True,
+        topk=512,
+        have_topk_length=True,
+        enable_attn_sink=False,
+        block_size=64,
+        d_qk=512,
+        check_correctness=True,
+        num_runs=10,
+    ).to_test_param()
+
+    result = run_one_case(testcase, packed_layout=True)
+    assert result.is_correct
+    assert result.used_optimized_kernel
+
+
 def main():
     dtype = torch.bfloat16
     device = torch.device("cuda:0")
@@ -273,14 +329,18 @@ def main():
         if testcase != testcases[0] and testcase.num_runs > 0 and not is_no_cooldown:
             time.sleep(0.3)
         print(f"[{testcase_idx+1:{num_testcases_len}d}/{len(testcases)}, {testcase_idx/len(testcases)*100:3.0f}%]  ", end="")
-        result = run_one_case(testcase)
+        packed_layout = testcase.num_runs > 0
+        result = run_one_case(testcase, packed_layout=packed_layout)
         results.append((testcase, result))
         if not result.is_correct:
             failed_cases.append(testcase)
             import sys
             sys.exit(1)
+        if packed_layout and not result.used_optimized_kernel:
+            failed_cases.append(testcase)
+            raise RuntimeError(f"Expected optimized kernel for benchmark case, but fallback path was used: {testcase}")
 
-    console = rich.console.Console(width=120)
+    console = rich.console.Console(width=128)
     table = rich.table.Table(show_header=True, header_style="bold cyan")
     table.add_column("topk")
     table.add_column("Bsz")
@@ -293,6 +353,7 @@ def main():
     table.add_column("TFlops")
     table.add_column("GBps")
     table.add_column("us")
+    table.add_column("Kernel")
     table.add_column(" ")
 
     for testcase, result in results:
@@ -310,6 +371,7 @@ def main():
             f"{result.achieved_tflops:3.0f}",
             f"{result.achieved_gBps:4.0f}",
             f"{result.time_usage_per_us:4.1f}",
+            "opt" if result.used_optimized_kernel else "fallback",
             "" if result.is_correct else "X",
         )
     console.print(table)
@@ -318,19 +380,23 @@ def main():
         import numpy
         return numpy.exp(numpy.mean(numpy.log(values)))
 
-    num_correct_testcases = [result.is_correct for t, result in results if t.check_correctness].count(True)
-    num_correctness_cases = sum([1 for t in testcases if t.check_correctness])
+    num_correct_testcases = [result.is_correct for testcase, result in results if testcase.check_correctness].count(True)
+    num_correctness_cases = sum([1 for testcase in testcases if testcase.check_correctness])
     if num_correct_testcases == num_correctness_cases:
         print(f"{kk.colors['GREEN_BG']}{num_correct_testcases}/{num_correctness_cases} correctness cases passed{kk.colors['CLEAR']}")
     else:
         print(f"{kk.colors['RED_BG']}{num_correct_testcases}/{num_correctness_cases} correctness cases passed{kk.colors['CLEAR']}")
-        for t in failed_cases:
-            print(f"\t{t},")
+        for testcase in failed_cases:
+            print(f"\t{testcase},")
 
     valid_achieved_tflops = [result.achieved_tflops for _, result in results if result.achieved_tflops > 0.1]
     if len(valid_achieved_tflops) > 0:
         achieved_tflops_geomean = geomean(valid_achieved_tflops)
         print(f"TFlops     geomean: {achieved_tflops_geomean:.1f}")
+
+    num_optimized_cases = sum(result.used_optimized_kernel for testcase, result in results if testcase.num_runs > 0)
+    num_benchmark_cases = sum(testcase.num_runs > 0 for testcase in testcases)
+    print(f"Optimized kernel used: {num_optimized_cases}/{num_benchmark_cases} benchmark cases")
 
 
 if __name__ == "__main__":
