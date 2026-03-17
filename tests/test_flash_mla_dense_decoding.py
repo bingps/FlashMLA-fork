@@ -1,8 +1,9 @@
 import argparse
+import importlib
 import math
 import random
 import dataclasses
-from typing import Tuple
+from typing import Tuple, List, Optional
 
 import torch
 
@@ -24,6 +25,16 @@ class TestParam:
     d: int = 576      # Q/K head dim (= dv + RoPE dim)
     dv: int = 512     # V head dim
     seed: int = 0
+
+
+@dataclasses.dataclass
+class Result:
+    is_correct: bool
+    compute_memory_ratio: float
+    time_usage_us: float
+    achieved_tflops: float
+    achieved_gBps: float
+    kernel_name: Optional[str] = None
 
 
 def generate_test_data(t: TestParam) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -142,7 +153,7 @@ def reference_torch(
 
 
 @torch.inference_mode()
-def test_flash_mla(t: TestParam):
+def test_flash_mla(t: TestParam) -> Result:
     print('-------------------------------')
     print(f"Running on {t}...")
 
@@ -171,8 +182,18 @@ def test_flash_mla(t: TestParam):
     is_correct &= kk.check_is_allclose("lse", lse_ans, lse_ref, abs_tol=1e-6, rel_tol=8.01 / 65536)
     assert is_correct
 
+    result = Result(
+        is_correct=is_correct,
+        compute_memory_ratio=0.0,
+        time_usage_us=0.0,
+        achieved_tflops=0.0,
+        achieved_gBps=0.0,
+        kernel_name=None,
+    )
+
     if t.test_performance:
-        time_usage = kk.bench_kineto(run_flash_mla, 10).get_kernel_time("flash_fwd_splitkv_mla_kernel")
+        kernel_name = "flash_fwd_splitkv_mla_kernel"
+        time_usage = kk.bench_kineto(run_flash_mla, 10).get_kernel_time(kernel_name)
 
         mean_attended_seqlens = cache_seqlens.float().mean().item()
         compute_volume_flop = t.b * t.h_q * t.s_q * sum([
@@ -186,10 +207,20 @@ def test_flash_mla(t: TestParam):
             mean_attended_seqlens * t.h_kv * kv_token_size,    # K/V
             t.s_q * t.h_q * (t.dv * q_elem_size),   # Output
         ])
+        compute_memory_ratio = compute_volume_flop / memory_volume_B
         achieved_tflops = compute_volume_flop / time_usage / 1e12
         achieved_gBps = memory_volume_B / time_usage / 1e9
+        time_usage_us = time_usage * 1e6
 
-        print(f"{time_usage * 1000:.3f} ms, {achieved_tflops:.0f} TFLOPS, {achieved_gBps:.0f} GB/s")
+        print(f"{time_usage_us:.1f} us, {achieved_tflops:.0f} TFLOPS, {achieved_gBps:.0f} GB/s")
+
+        result.compute_memory_ratio = compute_memory_ratio
+        result.time_usage_us = time_usage_us
+        result.achieved_tflops = achieved_tflops
+        result.achieved_gBps = achieved_gBps
+        result.kernel_name = kernel_name
+
+    return result
 
 
 def main(torch_dtype):
@@ -228,11 +259,91 @@ def main(torch_dtype):
         for s_q in [1, 2]
         for s_k in [4096, 8192, 16384, 32768]
     ]
+    performance_cases = [
+        TestParam(b, s_q, s_k, is_varlen=True, is_causal=True, test_performance=True)
+        for b in [1, 2, 4, 8, 16, 32, 64, 128]
+        for s_q in [1, 2]
+        for s_k in [2048]
+    ]
 
-    testcases = correctness_cases + corner_cases + performance_cases
+    # testcases = correctness_cases + corner_cases + performance_cases
+    testcases = performance_cases
 
+    results: List[Tuple[TestParam, Result]] = []
     for testcase in testcases:
-        test_flash_mla(testcase)
+        result = test_flash_mla(testcase)
+        results.append((testcase, result))
+
+    sorted_results = sorted(results, key=lambda item: (item[0].s_q, item[0].b))
+
+    rich_console = None
+    rich_table = None
+    try:
+        rich_console = importlib.import_module("rich.console")
+        rich_table = importlib.import_module("rich.table")
+    except ModuleNotFoundError:
+        pass
+
+    if rich_console is not None and rich_table is not None:
+        console = rich_console.Console(width=128)
+        table = rich_table.Table(show_header=True, header_style="bold cyan")
+        table.add_column("Bsz")
+        table.add_column("h_q&k")
+        table.add_column("sq")
+        table.add_column("sk")
+        table.add_column("Feats")
+        table.add_column("C/M")
+        table.add_column("TFlops")
+        table.add_column("GBps")
+        table.add_column("us")
+        table.add_column("Kernel")
+        table.add_column(" ")
+
+        for testcase, result in sorted_results:
+            feats = " V"[testcase.is_varlen] + " C"[testcase.is_causal] + " Z"[testcase.have_zero_seqlen_k]
+            table.add_row(
+                str(testcase.b),
+                f"{testcase.h_q:3d} {testcase.h_kv}",
+                str(testcase.s_q),
+                str(testcase.s_k),
+                feats,
+                f"{result.compute_memory_ratio:3.0f}",
+                f"{result.achieved_tflops:3.0f}",
+                f"{result.achieved_gBps:4.0f}",
+                f"{result.time_usage_us:6.1f}",
+                result.kernel_name or "-",
+                "" if result.is_correct else "X",
+            )
+
+        console.print(table)
+    else:
+        header = (
+            f"{'Bsz':>4} {'h_q&k':>7} {'sq':>3} {'sk':>6} {'Feats':>5} "
+            f"{'C/M':>4} {'TFlops':>6} {'GBps':>6} {'us':>8} {'Kernel':>30} {' ':>1}"
+        )
+        print(header)
+        print("-" * len(header))
+        for testcase, result in sorted_results:
+            feats = " V"[testcase.is_varlen] + " C"[testcase.is_causal] + " Z"[testcase.have_zero_seqlen_k]
+            print(
+                f"{testcase.b:4d} "
+                f"{(str(testcase.h_q) + ' ' + str(testcase.h_kv)):>7} "
+                f"{testcase.s_q:3d} "
+                f"{testcase.s_k:6d} "
+                f"{feats:>5} "
+                f"{result.compute_memory_ratio:4.0f} "
+                f"{result.achieved_tflops:6.0f} "
+                f"{result.achieved_gBps:6.0f} "
+                f"{result.time_usage_us:8.1f} "
+                f"{(result.kernel_name or '-'):>30} "
+                f"{' ' if result.is_correct else 'X'}"
+            )
+
+    num_correct = sum(result.is_correct for _, result in results)
+    if num_correct == len(results):
+        print(f"{kk.colors['GREEN_BG']}{num_correct}/{len(results)} cases passed{kk.colors['CLEAR']}")
+    else:
+        print(f"{kk.colors['RED_BG']}{num_correct}/{len(results)} cases passed{kk.colors['CLEAR']}")
 
 
 if __name__ == "__main__":

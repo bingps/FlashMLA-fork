@@ -104,10 +104,11 @@ def gen_testcase() -> List[RawTestParam]:
                         corner_cases.extend(cur_corner_cases)
 
     base_and_bszs = [
-        (RawTestParam(0, 128, 1, 1, 32768, True, topk=2048, d_qk=576), [1, 2, 64, 128]),
-        (RawTestParam(0, 128, 2, 1, 32768, True, topk=2048, d_qk=576), [1, 2, 64, 128]),
-        (RawTestParam(0, 128, 2, 1, 65536, True, topk=2048, d_qk=576), [1, 2]),
-        (RawTestParam(0, 128, 2, 1, 131072, True, topk=2048, d_qk=576), [1, 2]),
+        (RawTestParam(0, 128, 1, 1, 32768, True, topk=2048, d_qk=576), [1, 2, 4, 8, 16, 32, 64, 128]),
+        (RawTestParam(0, 128, 2, 1, 32768, True, topk=2048, d_qk=576), [1, 2, 4, 8, 16, 32, 64, 128]),
+        # (RawTestParam(0, 128, 2, 1, 32768, True, topk=2048, d_qk=576), [1, 2, 64, 128]),
+        # (RawTestParam(0, 128, 2, 1, 65536, True, topk=2048, d_qk=576), [1, 2]),
+        # (RawTestParam(0, 128, 2, 1, 131072, True, topk=2048, d_qk=576), [1, 2]),
         # (RawTestParam(0, 64, 2, 1, 16384, True, topk=128, d_qk=512, extra_s_k=16384, extra_topk=512, block_size=256, extra_block_size=64, num_runs=100, check_correctness=False), [2, 64, 128]),
         # (RawTestParam(0, 128, 2, 1, 16384, True, topk=128, d_qk=512, extra_s_k=16384, extra_topk=1024, block_size=256, extra_block_size=64, num_runs=100, check_correctness=False), [2, 64]),
     ]
@@ -117,7 +118,7 @@ def gen_testcase() -> List[RawTestParam]:
         for b in bszs
     ]
 
-    # return performance_cases
+    return performance_cases
     return correctness_cases + corner_cases + performance_cases
 
 
